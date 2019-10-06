@@ -1,0 +1,619 @@
+#include <stdio.h>
+#include <ctype.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+#define MAXNAME 80  /* maximum permitted name size, not including \0 */
+#define NPITS 6  /* number of pits on a side, not including the end pit */
+#define NPEBBLES 4 /* initial number of pebbles per pit */
+#define MAXMESSAGE (MAXNAME + 50) /* initial number of pebbles per pit */
+
+int port = 3000;
+int listenfd;
+
+struct player {
+    int fd;
+    char name[MAXNAME+1];
+    int pits[NPITS+1];  // pits[0..NPITS-1] are the regular pits
+                        // pits[NPITS] is the end pit
+    //other stuff undoubtedly needed here
+    struct player *next;
+    int has_name; //0 indicate no name
+};
+
+struct player *playerlist = NULL;
+
+//initilize current player
+struct player *cur_player;
+
+extern void parseargs(int argc, char **argv);
+extern void makelistener();
+extern int compute_average_pebbles();
+extern int game_is_over();  /* boolean */
+extern void broadcast(char *s);  /* you need to write this one */
+extern int check_name(struct player* player);
+extern void display();
+extern void broadcast(char *msg);
+extern int accept_connection(int fd);
+extern int find_network_newline(char *buf);
+extern void remove_player(struct player *player);
+extern void pass_cur_player();
+extern void move_pebbles(int move, struct player* p);
+extern int read_from(struct player* p);
+
+
+int main(int argc, char **argv) {
+    char msg[MAXMESSAGE];
+    parseargs(argc, argv);
+    makelistener();
+
+    int max_fd = listenfd;
+    fd_set all_fds;
+    FD_ZERO(&all_fds);
+    FD_SET(listenfd, &all_fds);
+
+    while (!game_is_over()) {
+      fd_set listen_fds = all_fds;
+      int nready = select(max_fd + 1, &listen_fds, NULL, NULL, NULL);
+      if (nready == -1) {
+          perror("server: select");
+          exit(1);
+      }
+
+
+      if (FD_ISSET(listenfd, &listen_fds)) {
+          int client_fd = accept_connection(listenfd);
+
+          if (client_fd > max_fd) {
+              max_fd = client_fd;
+          }
+
+          FD_SET(client_fd, &all_fds);
+          char greeting[MAXMESSAGE] = "Welcome to Mancala. What is your name?\r\n";
+          write(client_fd,greeting,strlen(greeting));
+
+      }
+
+      //check client
+      for (struct player *p = playerlist; p; p = p->next) {
+
+          if (FD_ISSET(p->fd, &listen_fds)) {
+
+            if (p->has_name == 0){// get name
+              char buf[MAXNAME+2];
+              int num_read = read(p->fd,buf,MAXNAME+1);
+
+              if (num_read + strlen(p->name)> MAXNAME){//too long name, remove this player
+                remove_player(p);
+                FD_CLR(p->fd,&all_fds);
+                free(p);
+              }else{
+                buf[num_read] = '\0';
+
+                strncat(p->name,buf,sizeof(p->name)-strlen(p->name)-1);
+
+                int if_find_newline = find_network_newline(buf);
+                if (if_find_newline != -1){
+                  //find newline
+                  //check if the name existed
+                  (p->name)[strlen(p->name)-1]='\0';
+                  int res = check_name(p);
+                  if (res == 1){//name existed before
+                    memset(p->name,'\0',MAXNAME+1);
+                    char notice[MAXMESSAGE] = "It is a existed name, please type a new one.\r\n";
+                    write(p->fd, notice, strlen(notice));
+                    break;
+                  }
+
+                  //server print name
+                  printf("client %s enter his name\n", p->name);
+
+                  char notice_newplayer[MAXMESSAGE];
+                  sprintf(notice_newplayer, "new player %s has joined.\r\n",p->name);
+
+                  p->has_name = 1;
+                  broadcast(notice_newplayer);
+
+                  if (cur_player == NULL){//first time initialize current player
+                    cur_player = p;
+                  }
+                  //broadcast
+                  display();
+
+                  for (struct player *p = playerlist; p; p = p->next){
+                    if(p->has_name == 1){
+                      if (p==cur_player){
+                        char notice[MAXMESSAGE];
+                        sprintf(notice, "Your move?\r\n");
+                        write(p->fd,notice,strlen(notice));
+                      }else{
+                        char notice[MAXMESSAGE];
+                        sprintf(notice, "It is %s's move.\r\n",cur_player->name);
+                        write(p->fd,notice,strlen(notice));
+                      }
+                    }
+                  }
+                }
+              }
+            }else{//already has name,deal move
+
+                // Note: never reduces max_fd
+                int client_closed = read_from(p);
+                if (client_closed > 0) {
+                    //this one is closed
+                    //if this is current player, pass to next player
+                    if (p->fd == cur_player->fd){
+                      pass_cur_player();
+                    }
+
+                    remove_player(p);
+
+                    display();
+
+                    for (struct player *p = playerlist; p; p = p->next){
+                      if(p->has_name == 1){
+                        if (p==cur_player){
+                          char notice[MAXMESSAGE];
+                          sprintf(notice, "Your move?\r\n");
+                          write(p->fd,notice,strlen(notice));
+                        }else{
+                          char notice[MAXMESSAGE];
+                          sprintf(notice, "It is %s's move.\r\n",cur_player->name);
+                          write(p->fd,notice,strlen(notice));
+                        }
+                      }
+                    }
+                    FD_CLR(client_closed, &all_fds);
+                    free(p);
+                    printf("Client %d disconnected\n", client_closed);
+                }
+                //if invalid move
+                else if (client_closed == -1){
+                  while (client_closed < 0){
+                    client_closed = read_from(p);
+                  }
+                  //check if disconnected
+                  if (client_closed > 0) {
+                      //if this is current player, pass to next player
+                      if (p->fd == cur_player->fd){
+                        pass_cur_player();
+                      }
+                      remove_player(p);
+                      FD_CLR(client_closed, &all_fds);
+                      free(p);
+                      printf("Client %d disconnected\n", client_closed);
+
+                      display();
+                      for (struct player *p = playerlist; p; p = p->next){
+                        if(p->has_name == 1){
+                          if (p==cur_player){
+                            char notice[MAXMESSAGE];
+                            sprintf(notice, "Your move?\r\n");
+                            write(p->fd,notice,strlen(notice));
+                          }else{
+                            char notice[MAXMESSAGE];
+                            sprintf(notice, "It is %s's move.\r\n",cur_player->name);
+                            write(p->fd,notice,strlen(notice));
+                          }
+                        }
+                      }
+                  }
+                }
+            }
+          }
+      }
+    }
+
+    broadcast("Game over!\r\n");
+    printf("Game over!\n");
+
+    for (struct player *p = playerlist; p; p = p->next) {
+        int points = 0;
+        for (int i = 0; i <= NPITS; i++) {
+            points += p->pits[i];
+        }
+        printf("%s has %d points\r\n", p->name, points);
+        snprintf(msg, MAXMESSAGE, "%s has %d points\r\n", p->name, points);
+        broadcast(msg);
+    }
+
+    return 0;
+}
+
+
+void parseargs(int argc, char **argv) {
+    int c, status = 0;
+    while ((c = getopt(argc, argv, "p:")) != EOF) {
+        switch (c) {
+        case 'p':
+            port = strtol(optarg, NULL, 0);
+            break;
+        default:
+            status++;
+        }
+    }
+    if (status || optind != argc) {
+        fprintf(stderr, "usage: %s [-p port]\n", argv[0]);
+        exit(1);
+    }
+}
+
+
+void makelistener() {
+    struct sockaddr_in r;
+
+    if ((listenfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        perror("socket");
+        exit(1);
+    }
+
+    int on = 1;
+    if (setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR,
+               (const char *) &on, sizeof(on)) == -1) {
+        perror("setsockopt");
+        exit(1);
+    }
+
+    memset(&r, '\0', sizeof(r));
+    r.sin_family = AF_INET;
+    r.sin_addr.s_addr = INADDR_ANY;
+    r.sin_port = htons(port);
+    if (bind(listenfd, (struct sockaddr *)&r, sizeof(r))) {
+        perror("bind");
+        exit(1);
+    }
+
+    if (listen(listenfd, 5)) {
+        perror("listen");
+        exit(1);
+    }
+}
+
+
+
+/* call this BEFORE linking the new player in to the list */
+int compute_average_pebbles() {
+    struct player *p;
+    int i;
+
+    if (playerlist == NULL) {
+        return NPEBBLES;
+    }
+
+    int nplayers = 0, npebbles = 0;
+    for (p = playerlist; p; p = p->next) {
+        nplayers++;
+        for (i = 0; i < NPITS; i++) {
+            npebbles += p->pits[i];
+        }
+    }
+    return ((npebbles - 1) / nplayers / NPITS + 1);  /* round up */
+}
+
+
+int game_is_over() { /* boolean, return 1 if gameover */
+    int i;
+
+    if (!playerlist) {
+       return 0;  /* we haven't even started yet! */
+    }
+
+    for (struct player *p = playerlist; p; p = p->next) {
+      if (p->has_name == 1){
+        int is_all_empty = 1;
+        for (i = 0; i < NPITS; i++) {
+            if (p->pits[i]) {
+                is_all_empty = 0;
+            }
+        }
+        if (is_all_empty) {
+            return 1;
+        }
+      }
+    }
+    return 0;
+}
+
+
+/*
+ * return 1 if this player name existed before, 0 otherwise
+ */
+int check_name(struct player* player){
+  int res = 0;
+  for(struct player *p = playerlist; p; p = p->next){
+    if(p->has_name==1 && strlen(p->name) == strlen(player->name) && strcmp(p->name,player->name) == 0){
+      res = 1;
+    }
+  }
+  return res;
+}
+
+
+/*
+ * display the game state
+ */
+void display(){
+  for (struct player *p = playerlist; p; p = p->next){
+    char game_state[MAXMESSAGE];
+    if(p->has_name == 1){//find a active player
+      sprintf(game_state, "%s: [0]%d [1]%d [2]%d [3]%d [4]%d [5]%d [end pit]%d\r\n", p->name, p->pits[0], p->pits[1], p->pits[2], p->pits[3], p->pits[4], p->pits[5], p->pits[6]);
+      broadcast(game_state);
+    }
+  }
+}
+
+/*
+ * this method do the broadcast
+ */
+void broadcast(char *msg){
+  for (struct player *p = playerlist; p; p = p->next){
+    if(p->has_name == 1){
+      write(p->fd, msg, strlen(msg));
+    }
+  }
+}
+
+
+/* Accept a connection. Note that a new file descriptor is created for
+ * communication with the client. The initial socket descriptor is used
+ * to accept connections, but the new socket is used to communicate.
+ * Return the new client's file descriptor or -1 on error.
+ */
+int accept_connection(int fd) {
+    int client_fd = accept(fd, NULL, NULL);
+    if (client_fd < 0) {
+        perror("server: accept");
+        close(fd);
+        exit(1);
+    }
+    printf("Accept connection from client %d\n", client_fd);
+
+    //deal with newcomer
+    struct player *newcomer = malloc(sizeof(struct player));
+
+    //populate pebbles
+    for (int i=0; i<NPITS;i++){
+      int z = compute_average_pebbles();
+      (newcomer->pits)[i] = z;
+    }
+
+    //populate end-pit
+    (newcomer->pits)[NPITS] = 0;
+
+    if (playerlist == NULL){
+
+      newcomer->fd = client_fd;
+      memset(newcomer->name,'\0',MAXNAME+1);
+      newcomer->has_name = 0;
+      playerlist = newcomer;
+      newcomer->next = NULL;
+    }else{
+      newcomer->fd = client_fd;
+      memset(newcomer->name,'\0',MAXNAME+1);
+      newcomer->has_name = 0;
+      newcomer->next = playerlist;
+      playerlist = newcomer;
+
+    }
+
+    return client_fd;
+}
+
+/*
+ * Search the first n characters of buf for a network newline (\r\n).
+ * Return one plus the index of the '\n' of the first network newline,
+ * or -1 if no network newline is found.
+ * Definitely do not use strchr or other string functions to search here. (Why not?)
+ */
+int find_network_newline(char *buf) {
+    int i;
+    int counter = 0;
+    int n = strlen(buf);
+    for (i=0; i<n; i++){
+      if (buf[i] == '\r' || buf[i] == '\n'){
+        counter = 1;
+      }
+    }
+    if (counter != 0){
+      return counter;
+    }
+    return -1;
+}
+
+/*
+ * remove the player from the linkedlist
+ */
+void remove_player(struct player *player){
+  //base case: only 1 node
+  if (playerlist->next == NULL){
+    playerlist = NULL;
+    cur_player = NULL;
+  }
+  //case:head
+  else if(player->fd == playerlist->fd){
+    playerlist = player->next;
+  }
+  //case:tail
+  else if(player->next == NULL){
+    struct player *cp = playerlist;
+    while((cp->next)->fd != player->fd){
+      cp = cp->next;
+    }
+    cp->next = NULL;
+  }else{
+    struct player *cp2 = playerlist;
+    while((cp2->next)->fd != player->fd){
+      cp2 = cp2->next;
+    }
+    (cp2->next) = player->next;
+    player->next = NULL;
+  }
+}
+
+/*
+ *  change the current player to next player.
+ */
+void pass_cur_player(){
+  int flag = 0;
+  struct player* pivot1 = cur_player->next;
+  while (pivot1 != NULL) {
+    if (pivot1->has_name == 1){
+      cur_player = pivot1;
+      flag = 1;
+      break;
+    }
+    pivot1 = pivot1->next;
+  }
+  if (flag == 0){
+    struct player* pivot2 = playerlist;
+    while (pivot2->fd != cur_player->fd){
+      if (pivot2->has_name == 1){
+        cur_player = pivot2;
+        flag = 1;
+        break;
+      }
+      pivot2 = pivot2->next;
+    }
+  }
+}
+
+/*
+ * the method to move the pebbles
+ */
+void move_pebbles(int move, struct player* p){
+  //first, get the num of pebbles in the move-pit and call it num_p
+  int num_p = (p->pits)[move];
+  //only move the pebbles to own pits
+  if (num_p <= NPITS - move){
+
+    (p->pits)[move]=0;
+    for(int i = move+1; i<move+num_p+1; i++){
+      (p->pits)[i] +=1;
+    }
+    num_p=0;
+
+  }else{
+    //also move the pebbles to other pits
+    (p->pits)[move]=0;
+    for(int i = move+1; i<NPITS+1; i++){
+      (p->pits)[i] +=1;
+      num_p-=1;
+    }
+    struct player* next_player = p->next;
+    while (num_p>0) {
+      //find next has-name node
+      if (next_player == NULL) {
+        next_player = playerlist;
+      }
+      while (next_player->has_name == 0) {
+        //if next_player is the tail
+        if (next_player->next == NULL) {
+          next_player = playerlist;
+        }
+        next_player = next_player->next;
+      }
+      //edit next_player pits
+      if (next_player->fd == p->fd) {//go back to itself
+        if (num_p <= NPITS+1) {
+          for(int i = 0; i<num_p; i++){
+            (next_player->pits)[i] +=1;
+          }
+          num_p = 0;
+        }else{
+          for(int i = 0; i<NPITS+1; i++){
+            (next_player->pits)[i] +=1;
+          }
+          num_p -= NPITS+1;
+        }
+      }else{//regular next player
+        if (num_p <= NPITS) {
+          for(int i = 0; i<num_p; i++){
+            (next_player->pits)[i] +=1;
+          }
+          num_p = 0;
+        }else{
+          for(int i = 0; i<NPITS; i++){
+            (next_player->pits)[i] +=1;
+          }
+          num_p -= NPITS;
+        }
+      }
+      next_player = next_player->next;
+    }
+  }
+}
+/*
+ * Read a message from client, do move.
+ * Return the fd if it has been closed or 0 if normal, -1 if invalid move, -2 if this is not your turn.
+ */
+int read_from(struct player* p) {
+    //read the content from p's file descriptor
+    char buf[MAXMESSAGE + 1];
+    int num_read = read(p->fd, &buf, MAXMESSAGE);
+    buf[num_read] = '\0';
+
+
+    if (num_read == 0) {//closed
+        return p->fd;
+    }
+
+    if (p->fd != cur_player->fd){
+      char warning[MAXMESSAGE] = "it is not your turn\r\n";
+      write(p->fd,warning,strlen(warning));
+      return -2;
+    }
+    int move = strtol(buf,NULL,10);
+    //check the move
+    if (move < 0 || move > NPITS-1){
+      char notice[MAXMESSAGE] = "it is not a valid pit, move again\r\n";
+      write(p->fd,notice,strlen(notice));
+      return -1;
+    }
+
+    //check if there is chess in pit
+    int num_p = (p->pits)[move];
+    if (num_p == 0){
+      char notice[MAXMESSAGE] = "it is not a valid pit, move again\r\n";
+      write(p->fd,notice,strlen(notice));
+      return -1;
+    }
+
+    //notice other this move
+    char notice[MAXMESSAGE];
+    sprintf(notice, "Player %s make a move %d\r\n",cur_player->name,move);
+    printf("Player %s make a move %d\n",cur_player->name,move);
+
+    for (struct player *p = playerlist; p; p = p->next){
+      if(p->has_name == 1){
+        if (p!=cur_player){
+          write(p->fd,notice,strlen(notice));
+        }
+      }
+    }
+    //move pebbles from here
+    move_pebbles(move, p);
+
+    pass_cur_player();
+    //display state
+    display();
+    //notify
+    for (struct player *p = playerlist; p; p = p->next){
+      if(p->has_name == 1){
+        if (p==cur_player){
+          char notice[MAXMESSAGE];
+          sprintf(notice, "Your move?\r\n");
+          write(p->fd,notice,strlen(notice));
+        }else{
+          char notice[MAXMESSAGE];
+          sprintf(notice, "It is %s's move.\r\n",cur_player->name);
+          write(p->fd,notice,strlen(notice));
+        }
+      }
+    }
+    return 0;
+}
